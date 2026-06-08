@@ -1,0 +1,72 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import time
+from datetime import datetime
+
+import torch
+import torch.optim as optim
+from tensorboardX import SummaryWriter
+
+import cfg
+from function import function
+from conf import settings
+from function.utils import get_network, set_log_dir, create_logger
+from function.dataset import get_dataloader
+
+
+def main():
+    args = cfg.parse_args()
+    GPUdevice = torch.device('cuda', args.gpu_device)
+    net = get_network(args, args.net, use_gpu=args.gpu, gpu_device=GPUdevice, distribution=args.distributed)
+    net.to(dtype=torch.bfloat16).cuda()
+    if args.pretrain:
+        print(args.pretrain)
+        weights = torch.load(args.pretrain)
+        net.load_state_dict(weights, strict=False)
+
+    sam_layers = (
+            []
+              # + list(net.image_encoder.parameters())
+            #   + list(net.sam_prompt_encoder.parameters())
+            + list(net.sam_mask_decoder.parameters())
+    )
+    mem_layers = (
+            []
+            + list(net.obj_ptr_proj.parameters())
+            + list(net.memory_encoder.parameters())
+            + list(net.memory_attention.parameters())
+            + list(net.mask_downsample.parameters())
+    )
+    if len(sam_layers) == 0:
+        optimizer1 = None
+    else:
+        optimizer1 = optim.Adam(sam_layers, lr=1e-4, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+    if len(mem_layers) == 0:
+        optimizer2 = None
+    else:
+        optimizer2 = optim.Adam(mem_layers, lr=1e-8, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5) #learning rate decay
+
+    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    torch.autograd.set_detect_anomaly(True)  # 2024/9/26
+
+    if torch.cuda.get_device_properties(0).major >= 8:
+        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    args.path_helper = set_log_dir('logs', args.exp_name)
+    logger = create_logger(args.path_helper['log_path'])
+    logger.info(args)
+
+    nice_train_loader, nice_test_loader = get_dataloader(args)
+
+    import json
+    json_file_path = '/home/user0/BRL/fabian/BRL/zhangxin/Codes/SAM2/Medical-SAM2-main/gmflow/data.json'
+    with open(json_file_path, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+    function.test_sam(args, nice_test_loader, net, "MoCA_test", data)
+
+if __name__ == '__main__':
+    main()
+
